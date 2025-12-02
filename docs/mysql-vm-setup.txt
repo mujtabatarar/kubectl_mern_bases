@@ -1,0 +1,131 @@
+===============================================================================
+ALMA-DB SETUP – STANDALONE MYSQL + DNS (BIND) SERVER
+===============================================================================
+Host: alma-db (AlmaLinux 9, 1 vCPU / 4 GB RAM)
+IP: 192.168.56.20/24 (example)
+Purpose: Provide persistent MySQL service & internal DNS for lab.local domain.
+
+-------------------------------------------------------------------------------
+
+
+-------------------------------------------------------------------------------
+2. DNS Server (BIND) – lab.local zone
+-------------------------------------------------------------------------------
+2.1 Configure /etc/named.conf
+- Ensure `listen-on port 53 { 127.0.0.1; 192.168.56.20; };`  # Listen on localhost + VM IP
+- Allow your subnet in `allow-query { localhost; 192.168.56.0/24; };`  # Permit clients in lab network
+- Include custom zone file:  # Add the lab.local DNS zone definition
+  zone "lab.local" IN {
+      type master;
+      file "lab.local.db";
+      allow-update { none; };
+  };
+
+2.2 Create zone file /var/named/lab.local.db
+# $TTL sets default time-to-live for all records in this zone (1 hour).
+$TTL 1H
+# SOA (Start of Authority) defines the primary DNS server and admin contact.
+@   IN SOA alma-db.lab.local. admin.lab.local. (
+        2023112601 ; serial       # Increment whenever the zone file changes
+        1H         ; refresh      # Secondary servers wait 1h before checking for updates
+        15M        ; retry        # Retry interval if refresh fails
+        1W         ; expire       # Give up after 1 week if unable to refresh
+        1H )       ; minimum      # Negative caching TTL
+# NS record points to this server as authoritative.
+    IN  NS  alma-db.lab.local.
+# A record for the server itself.
+alma-db IN A   192.168.56.20
+
+; Application endpoints (update IPs to MetalLB / ingress)
+tyk         IN A 192.168.56.51
+react       IN A 192.168.56.51
+api         IN A 192.168.56.51
+argo        IN A 192.168.56.51
+chaos       IN A 192.168.56.51
+otel        IN A 192.168.56.52
+mysql       IN A 192.168.56.20   ; points to this host
+
+; Wildcard optional – routes any *.lab.local name to ingress
+*.lab.local IN A 192.168.56.51
+
+2.3 Permissions & SELinux
+# Give ownership to root/named so BIND can read the zone.
+sudo chown root:named /var/named/lab.local.db
+# Allow read for owner + group, nothing for others.
+sudo chmod 640 /var/named/lab.local.db
+# Apply correct SELinux context recursively to /var/named.
+sudo restorecon -rv /var/named
+
+2.4 Start BIND
+# Enable & start named (BIND DNS daemon) immediately.
+sudo systemctl enable --now named
+# Open DNS service (UDP/TCP 53) permanently in firewalld.
+sudo firewall-cmd --add-service=dns --permanent
+# Reload firewall rules so the new service is active.
+sudo firewall-cmd --reload
+
+2.5 Test from another node:
+# Query the new DNS server to ensure records resolve.
+dig @192.168.56.20 tyk.lab.local
+
+-------------------------------------------------------------------------------
+3. MySQL 8.0 Installation
+-------------------------------------------------------------------------------
+3.1 Install
+# Install MySQL server using the AlmaLinux module.
+sudo dnf install -y @mysql
+# Alternative: install latest community MySQL RPM.
+sudo dnf install -y mysql-server
+
+3.2 Configure
+# Start MySQL now and enable on boot.
+sudo systemctl enable --now mysqld
+# Run hardening wizard: set root password, remove insecure defaults.
+sudo mysql_secure_installation
+  - Set root password    # Choose a strong root password
+  - Remove anonymous users  # Prevent logins without account
+  - Disallow remote root login  # Only allow root locally
+  - Remove test DB   # Drop default test database
+
+3.3 Create application database/user
+# Connect as root and create database/user for the app in one heredoc.
+mysql -u root -p <<'EOF'
+CREATE DATABASE sample_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER 'appuser'@'192.168.56.%' IDENTIFIED BY 'apppassword';
+GRANT ALL PRIVILEGES ON sample_db.* TO 'appuser'@'192.168.56.%';
+FLUSH PRIVILEGES;
+EOF
+
+3.4 Import schema (from repository database/init.sql)
+# Load prebuilt schema/data into sample_db.
+mysql -u root -p sample_db < /path/to/sample-react-project/database/init.sql
+
+3.5 Allow external connections (bind-address)
+Edit /etc/my.cnf.d/mysqld.cnf:
+  bind-address = 0.0.0.0
+# Restart MySQL so the new bind-address takes effect.
+sudo systemctl restart mysqld
+
+3.6 Firewall
+# Permanently allow MySQL service (TCP 3306) through the firewall.
+sudo firewall-cmd --add-service=mysql --permanent
+# Reload firewall rules to apply the change.
+sudo firewall-cmd --reload
+
+-------------------------------------------------------------------------------
+4. Backups
+-------------------------------------------------------------------------------
+- Logical dump: `mysqldump -u root -p sample_db > /root/sample_db.sql`
+- Cron job (daily) storing dumps in /var/backups/mysql
+- Consider enabling binary logs for PITR (point-in-time recovery).
+
+-------------------------------------------------------------------------------
+5. Verification Checklist
+-------------------------------------------------------------------------------
+- [ ] `systemctl status named` and `mysqld` both active.
+- [ ] `dig @192.168.56.20 react.lab.local` returns expected IP.
+- [ ] From Kubernetes node: `mysql -h mysql.lab.local -u appuser -p`.
+- [ ] TLS certificates trust chain distributed to clients.
+
+End of document.
+

@@ -2,6 +2,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: frontend
+  namespace: sample-app
   labels:
     app: frontend
 spec:
@@ -28,7 +29,7 @@ spec:
     spec:
       containers:
       - name: frontend
-        image: react-frontend:latest
+        image: docker.io/mujtabatarar/react-sample-app:1.0.0
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 80

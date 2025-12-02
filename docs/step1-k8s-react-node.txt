@@ -1,0 +1,237 @@
+===============================================================================
+STEP 1 – DEPLOY REACT + NODE + MYSQL IN KUBERNETES (INSIDE CLUSTER)
+===============================================================================
+Goal of this step:
+- Use ONLY the 5 AlmaLinux VMs (no Windows access to cluster).
+- Deploy:
+  - MySQL inside Kubernetes
+  - Node.js backend inside Kubernetes
+  - React frontend inside Kubernetes
+- Make sure the app works via port-forward (no DNS, no HTTPS, no Argo yet).
+
+We will use the existing YAML files in the `k8s` folder of your project:
+- `k8s/mysql-configmap.yaml`
+- `k8s/mysql-deployment.yaml`
+- `k8s/backend-deployment.yaml`
+- `k8s/frontend-deployment.yaml`
+
+Namespace used for this step: `sample-app`
+(This matches the `namespace: sample-app` lines already inside the YAML.)
+
+-------------------------------------------------------------------------------
+0. Where to run the commands
+-------------------------------------------------------------------------------
+- Log into one Kubernetes node (for example `alma-one`) via console or SSH.
+- Make sure `kubectl` works there:
+
+  kubectl get nodes
+
+  You should see all your cluster nodes in `Ready` state.
+
+- Make sure your project folder (the one with `k8s/` and `backend/` and `frontend/`)
+  is present on this node, for example:
+
+  /home/youruser/sample-react-project
+
+  Then:
+
+  cd /home/youruser/sample-react-project
+
+-------------------------------------------------------------------------------
+1. Create the namespace
+-------------------------------------------------------------------------------
+Why: A namespace is just a logical folder inside Kubernetes. We will put all
+our app components into `sample-app`.
+
+Command:
+
+  kubectl create namespace sample-app
+
+If you get an error like "AlreadyExists", that is fine; it means the namespace
+was already created before.
+
+Check:
+
+  kubectl get namespaces
+
+You should see a line with:
+
+  sample-app   Active   ...
+
+-------------------------------------------------------------------------------
+2. Deploy MySQL (database inside Kubernetes)
+-------------------------------------------------------------------------------
+We will deploy:
+- A ConfigMap with the SQL script (creates DB + table + sample rows)
+- A PersistentVolumeClaim for storage
+- A MySQL Deployment + Service
+
+2.1 Apply the ConfigMap (SQL init script)
+
+From the project root folder:
+
+  kubectl apply -f k8s/mysql-configmap.yaml
+
+What this does:
+- Creates a ConfigMap named `mysql-init` in namespace `sample-app`.
+- This ConfigMap contains `init.sql` which MySQL runs on first start.
+
+2.2 Apply the MySQL PVC + Service + Deployment
+
+  kubectl apply -f k8s/mysql-deployment.yaml
+
+What this does:
+- PVC `mysql-pvc` (requests 1Gi of storage)
+- Service `mysql` (DNS name inside cluster: `mysql.sample-app.svc.cluster.local`)
+- Deployment `mysql` (1 replica, using Docker image `mysql:8.0`)
+- MySQL env vars:
+  - `MYSQL_ROOT_PASSWORD=rootpassword`
+  - `MYSQL_DATABASE=sample_db`
+  - `MYSQL_USER=appuser`
+  - `MYSQL_PASSWORD=apppassword`
+
+2.3 Check MySQL pod status
+
+  kubectl get pods -n sample-app
+
+Look for a pod name starting with `mysql-`:
+- STATUS should become `Running`.
+- If STATUS is `Pending`, `CrashLoopBackOff`, or `Error`, run:
+
+  kubectl describe pod <mysql-pod-name> -n sample-app
+
+and read the message. If that happens, stop and ask for help with the output.
+
+-------------------------------------------------------------------------------
+3. Deploy the Node.js backend
+-------------------------------------------------------------------------------
+The backend will:
+- Listen on port 3001
+- Connect to MySQL using service name `mysql`
+- Provide HTTP API endpoints `/health`, `/api/users`, etc.
+
+3.1 Apply backend Service + Deployment
+
+  kubectl apply -f k8s/backend-deployment.yaml
+
+What this does:
+- Service `backend` in namespace `sample-app` (ClusterIP)
+  - Other pods can reach it as `backend.sample-app.svc.cluster.local:3001`
+- Deployment `backend` (2 replicas) with image:
+  - `docker.io/mujtabatarar/node-sample-app:1.0.0`
+- Environment variables:
+  - `DB_HOST=mysql`
+  - `DB_USER=appuser`
+  - `DB_PASSWORD=apppassword`
+  - `DB_NAME=sample_db`
+  - `DB_PORT=3306`
+
+3.2 Check backend pods
+
+  kubectl get pods -n sample-app
+
+You should see 2 pods whose names start with `backend-`.
+- Wait until their STATUS is `Running`.
+- If they keep restarting:
+
+  kubectl describe pod <backend-pod-name> -n sample-app
+  kubectl logs <backend-pod-name> -n sample-app
+
+Send the output if you need help interpreting it.
+
+-------------------------------------------------------------------------------
+4. Deploy the React frontend
+-------------------------------------------------------------------------------
+The frontend:
+- Is served by nginx inside the container.
+- Listens on port 80 inside the pod.
+- Talks to the backend using relative path `/api/...` which nginx proxies
+  to the `backend` service (configured via `frontend/nginx.conf`).
+
+4.1 Apply frontend Service + Deployment
+
+  kubectl apply -f k8s/frontend-deployment.yaml
+
+What this does:
+- Service `frontend` (type: LoadBalancer) in namespace `sample-app`
+  - For now we will ignore the LoadBalancer external IP and just use port-forward.
+- Deployment `frontend` (2 replicas) with image:
+  - `docker.io/mujtabatarar/react-sample-app:1.0.0`
+
+4.2 Check frontend pods
+
+  kubectl get pods -n sample-app
+
+Look for 2 pods starting with `frontend-`.
+- Wait until STATUS is `Running`.
+- If they are stuck or restarting, run:
+
+  kubectl describe pod <frontend-pod-name> -n sample-app
+  kubectl logs <frontend-pod-name> -n sample-app
+
+-------------------------------------------------------------------------------
+5. Verify all resources
+-------------------------------------------------------------------------------
+Run:
+
+  kubectl get all -n sample-app
+
+You should see something like:
+- 1 `deployment/mysql`, 1 `deployment/backend`, 1 `deployment/frontend`
+- 1 `service/mysql`, 1 `service/backend`, 1 `service/frontend`
+- Several pods in `Running` state
+
+If anything is not `Running`, fix that first before moving to the next step.
+
+-------------------------------------------------------------------------------
+6. Access the frontend from one Alma VM (no DNS, no HTTPS yet)
+-------------------------------------------------------------------------------
+We will use `kubectl port-forward` so that:
+- Port 4000 on the Alma VM forwards to port 80 of the `frontend` service
+  inside the cluster.
+
+From the node where you are running `kubectl` (for example `alma-one`):
+
+  kubectl port-forward -n sample-app svc/frontend 4000:80
+
+You should see output like:
+
+  Forwarding from 127.0.0.1:4000 -> 80
+
+Now, from **the same Alma VM** open a browser (if it has GUI) or, if you have
+SSH tunnel from your Windows host, open:
+
+  http://localhost:4000
+
+Expected result:
+- You see the React UI with title like "Simple React + Node.js + MySQL App".
+- The users list shows initial users from MySQL ("John Doe", "Jane Smith").
+- You can add a new user via the form and see it appear in the list.
+
+If the page loads but shows an error about fetching users:
+- Check backend pods logs:
+
+  kubectl logs <backend-pod-name> -n sample-app
+
+-------------------------------------------------------------------------------
+7. What to do before Step 2
+-------------------------------------------------------------------------------
+Before we move to:
+- Step 2 (secret management)
+
+Make sure you can say “YES” to all of these:
+- [ ] Namespace `sample-app` exists.
+- [ ] MySQL pod is `Running` in `sample-app`.
+- [ ] Backend pods are `Running` in `sample-app`.
+- [ ] Frontend pods are `Running` in `sample-app`.
+- [ ] `kubectl get all -n sample-app` shows Services + Deployments for all three.
+- [ ] `kubectl port-forward -n sample-app svc/frontend 4000:80` works.
+- [ ] You can open `http://localhost:4000` (via the Alma VM / tunnel) and use the app.
+
+Once all of these pass, tell me, and we will create **Step 2 file**
+for secrets (moving DB password and other sensitive things into Kubernetes
+`Secret` objects) as the next lab step.
+
+End of Step 1 document.
+
+

@@ -1,0 +1,513 @@
+===============================================================================
+FULL LAB GUIDE – MULTI-VM ALMA LINUX ENVIRONMENT
+===============================================================================
+Lab goal: Build an end-to-end platform (Kubernetes + React/Node app + Tyk API
+Gateway + Istio service mesh + Chaos Mesh + Argo CD + Elasticsearch tracing +
+internal DNS + TLS) using 5 AlmaLinux worker/control-plane VMs
+(alma-one … alma-five, 1 vCPU / 4 GB RAM each) and a dedicated MySQL VM
+(alma-db). Starting point: brand new VMs, no software installed.
+
+-------------------------------------------------------------------------------
+0. Reference Diagram (logical)
+-------------------------------------------------------------------------------
+Workload namespaces:
+- tyk-gateway: Tyk control plane + API gateway + dashboard
+- platform-apps: React frontend + Node backend + supporting services
+- observability: Elasticsearch + OpenTelemetry collector
+- chaos-testing: Chaos Mesh
+- cicd: Argo CD
+
+VM roles (example):
+- alma-one: Kubernetes control-plane #1 (kube-apiserver, etcd, sched, controller)
+- alma-two: Kubernetes control-plane #2 (HA) + worker
+- alma-three: worker (apps, Tyk)
+- alma-four: worker (observability, Argo)
+- alma-five: worker (chaos, spare)
+- alma-db: standalone MySQL (outside cluster) + BIND DNS (optional)
+
+Networking assumptions:
+- All VMs on same Layer-2 network, static IPs (example):
+  * alma-one 192.168.56.11
+  * alma-two 192.168.56.12
+  * alma-three 192.168.56.13
+  * alma-four 192.168.56.14
+  * alma-five 192.168.56.15
+  * alma-db   192.168.56.20
+- DNS zone: lab.local (custom, only resolvable inside LAN)
+- TLS: internal CA using cfssl or mkcert; wildcard cert *.lab.local
+- Load balancing: MetalLB providing LoadBalancer IPs (192.168.56.50-192.168.56.60)
+
+-------------------------------------------------------------------------------
+1. Base VM Preparation (repeat on alma-one … alma-five unless noted)
+-------------------------------------------------------------------------------
+1.1 OS updates & tools
+  sudo dnf update -y
+  sudo dnf install -y vim git curl wget tar socat conntrack ebtables ethtool
+
+1.2 Disable swap (required for kubelet)
+  sudo swapoff -a
+  sudo sed -i '/swap/d' /etc/fstab
+
+1.3 Kernel modules & sysctl for container networking
+  cat <<'EOF' | sudo tee /etc/modules-load.d/k8s.conf
+  overlay
+  br_netfilter 
+  EOF
+  sudo modprobe overlay
+  -> It enables the filesystem feature that containers use to store layered images.
+
+  sudo modprobe br_netfilter 
+  -> It allows Linux to inspect and filter packets that pass through a network bridge—something Kubernetes needs.
+
+  cat <<'EOF' | sudo tee /etc/sysctl.d/99-k8s.conf -> These settings permanently modify how the Linux kernel handles networking.
+  net.bridge.bridge-nf-call-iptables  = 1 
+  net.bridge.bridge-nf-call-ip6tables = 1
+  net.ipv4.ip_forward                 = 1
+  EOF
+
+  1 -> This makes Linux send bridged IPv4 traffic through iptables.
+     Required for Kubernetes CNI plugins (Flannel, Calico, Cilium, etc.)
+     Ensures kube-proxy’s iptables rules apply to pod network traffic.
+  2 -> same as above but for ipv6.
+  3 -> Allows Linux to route packets between interfaces.
+
+  sudo sysctl --system
+  -> reloads all kernel parameter configuration files.
+
+1.4 Install container runtime (containerd)
+  sudo dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+  sudo dnf install -y containerd.io
+  sudo mkdir -p /etc/containerd
+  sudo containerd config default | sudo tee /etc/containerd/config.toml
+  # set SystemdCgroup = true in config.toml
+  sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+  sudo systemctl enable --now containerd
+
+/* Some packages are not avaliable so they 
+1.5 Install kubeadm / kubelet / kubectl (v1.30 example)
+  cat <<'EOF' | sudo tee /etc/yum.repos.d/kubernetes.repo
+  [kubernetes]
+  name=Kubernetes
+  baseurl=https://pkgs.k8s.io/core:/stable:/v1.30/rpm/
+  enabled=1
+  gpgcheck=1
+  gpgkey=https://pkgs.k8s.io/core:/stable:/v1.30/rpm/repodata/repomd.xml.key
+  EOF
+
+  sudo yum clean all
+  sudo yum makecache
+    -> yum will clean cache and make new cache.
+
+
+  sudo dnf install -y kubeadm kubelet kubectl
+  sudo systemctl enable --now kubelet
+
+1.6 Set unique hostnames (already alma-one, etc.). Ensure /etc/hosts contains all nodes.
+
+-------------------------------------------------------------------------------
+2. Kubernetes Control Plane Bootstrap (alma-one primary)
+-------------------------------------------------------------------------------
+2.1 kubeadm init (use Container Network Interface CIDR 10.244.0.0/16 for Cilium)
+  sudo kubeadm init \
+    --control-plane-endpoint "192.168.56.101:6443" \
+    --upload-certs \
+    --pod-network-cidr=10.244.0.0/16
+
+2.2 Configure kubectl for root and regular user
+  mkdir -p $HOME/.kube
+  sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+  sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+2.3 Install CNI (Cilium example with kube-proxy replacement)
+  curl -L https://github.com/cilium/cilium-cli/releases/latest/download/cilium-linux-amd64.tar.gz | tar xz
+  sudo mv cilium /usr/local/bin
+  cilium install --version 1.15.3 --set kubeProxyReplacement=true
+  cilium status --wait
+
+2.4 Capture kubeadm join commands (for control-plane + worker). Save to docs/kubeadm-join.txt.
+
+-------------------------------------------------------------------------------
+3. Join Remaining Nodes
+-------------------------------------------------------------------------------
+3.1 Control-plane join (alma-two)
+  sudo kubeadm join 192.168.56.101:6443 --token <token> \
+    --discovery-token-ca-cert-hash sha256:<hash> \
+    --control-plane --certificate-key <cert-key>
+
+3.2 Worker join (alma-three … alma-five)
+  sudo kubeadm join 192.168.56.101:6443 --token <token> \
+    --discovery-token-ca-cert-hash sha256:<hash>
+
+3.3 Verify cluster
+  kubectl get nodes -o wide
+  
+  cilium status
+
+-------------------------------------------------------------------------------
+4. Cluster Add-ons (shared)
+-------------------------------------------------------------------------------
+4.1 MetalLB (LoadBalancer IPs)
+  kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.5/config/manifests/metallb-native.yaml
+  cat <<'EOF' | kubectl apply -f -
+  apiVersion: metallb.io/v1beta1
+  kind: IPAddressPool
+  metadata:
+    name: homelab-pool
+    namespace: metallb-system
+  spec:
+    addresses:
+      - 192.168.56.50-192.168.56.60
+  ---
+  apiVersion: metallb.io/v1beta1
+  kind: L2Advertisement
+  metadata:
+    name: homelab-l2
+    namespace: metallb-system
+  EOF
+
+4.2 Cert-manager (internal CA + self-signed certs)
+  helm repo add jetstack https://charts.jetstack.io
+  helm repo update
+  helm install cert-manager jetstack/cert-manager \
+    --namespace cert-manager \
+    --create-namespace \
+    --set installCRDs=true
+
+  # Create cluster issuer for self-signed root + wildcard
+  cat <<'EOF' | kubectl apply -f -
+  apiVersion: cert-manager.io/v1
+  kind: ClusterIssuer
+  metadata:
+    name: lab-selfsigned
+  spec:
+    selfSigned: {}
+  ---
+  apiVersion: cert-manager.io/v1
+  kind: ClusterIssuer
+  metadata:
+    name: lab-ca
+  spec:
+    ca:
+      secretName: lab-root-ca
+  EOF
+
+  # Generate root CA
+  kubectl apply -f - <<'EOF'
+  apiVersion: cert-manager.io/v1
+  kind: Certificate
+  metadata:
+    name: lab-root-ca
+    namespace: cert-manager
+  spec:
+    isCA: true
+    duration: 87600h # 10 years
+    secretName: lab-root-ca
+    issuerRef:
+      name: lab-selfsigned
+      kind: ClusterIssuer
+  EOF
+
+  # Wildcard certificate
+  kubectl apply -f - <<'EOF'
+  apiVersion: cert-manager.io/v1
+  kind: Certificate
+  metadata:
+    name: wildcard-lab-local
+    namespace: cert-manager
+  spec:
+    secretName: wildcard-lab-local
+    duration: 8760h
+    dnsNames:
+      - '*.lab.local'
+    issuerRef:
+      name: lab-ca
+      kind: ClusterIssuer
+  EOF
+
+4.3 Internal DNS (CoreDNS override + BIND on alma-db)
+  - Run BIND on alma-db to serve zone lab.local (see mysql-vm file).
+  - Point each AlmaLinux node to alma-db as primary DNS (nmcli con mod ... ipv4.dns "192.168.56.20").
+  - For Kubernetes services (e.g., tyk.lab.local), create MetalLB LoadBalancer + matching A record in BIND.
+
+-------------------------------------------------------------------------------
+5. Namespaces & RBAC
+-------------------------------------------------------------------------------
+kubectl create namespace platform-apps
+kubectl create namespace tyk-gateway
+kubectl create namespace observability
+kubectl create namespace chaos-testing
+kubectl create namespace cicd
+
+Example RBAC: create admin service accounts per namespace with kubeconfig if needed.
+
+-------------------------------------------------------------------------------
+6. MySQL External VM (alma-db) Integration
+-------------------------------------------------------------------------------
+See docs/mysql-vm-setup.txt for full steps. Summary:
+- Install MySQL 8.0, create user/app DB, allow node subnet access.
+- Enable firewall ports (3306).
+- Create DNS entry mysql.lab.local -> 192.168.56.20.
+- Update backend deployment DB_HOST to mysql.lab.local (or use Secret).
+
+-------------------------------------------------------------------------------
+7. React + Node Deployment (platform-apps namespace)
+-------------------------------------------------------------------------------
+7.1 Build/push images to registry accessible by cluster (e.g., Docker Hub or local Harbor). Tags:
+  docker build -t <registry>/react-sample-app:1.0.0 frontend
+  docker build -t <registry>/node-sample-app:1.0.0 backend
+  docker push ...
+
+7.2 Create image pull secret if using private registry:
+  kubectl -n platform-apps create secret docker-registry regcred \
+    --docker-server=<registry> --docker-username=<user> --docker-password=<token>
+
+7.3 Apply manifests (update image references & DB host)
+  kubectl -n platform-apps apply -f k8s/mysql-configmap.yaml   # optional if still using cluster MySQL
+  kubectl -n platform-apps apply -f k8s/backend-deployment.yaml
+  kubectl -n platform-apps apply -f k8s/frontend-deployment.yaml
+
+7.4 Expose via Istio ingress (later) or temporary LoadBalancer (MetalLB).
+
+-------------------------------------------------------------------------------
+8. Tyk API Gateway Namespace (tyk-gateway)
+-------------------------------------------------------------------------------
+8.1 Helm repo & namespace
+  helm repo add tyk-helm https://helm.tyk.io/public/helm/charts/
+  helm repo update
+  kubectl create namespace tyk-gateway
+
+8.2 Values file (tyk-values.yaml) key points:
+  global:
+    license: "<trial-or-enterprise-key>"
+  dashboard:
+    ingress:
+      enabled: true
+      className: istio
+      hosts:
+        - host: tyk.lab.local
+          paths:
+            - /
+      tls:
+        - hosts: [tyk.lab.local]
+          secretName: wildcard-lab-local
+  gateway:
+    service:
+      type: LoadBalancer
+      annotations:
+        metallb.universe.tf/address-pool: homelab-pool
+
+8.3 Install
+  helm install tyk tyk-helm/tyk-pro -n tyk-gateway -f tyk-values.yaml
+
+8.4 Create DNS A record tyk.lab.local -> MetalLB IP. Access via https://tyk.lab.local (trust internal CA).
+
+-------------------------------------------------------------------------------
+9. Service Mesh (Istio)
+-------------------------------------------------------------------------------
+9.1 Install Istio CLI & demo profile
+  curl -L https://istio.io/downloadIstio | sh -
+  export PATH="$PATH:$HOME/istio-1.23.0/bin"
+  istioctl install --set profile=demo -y
+
+9.2 Enable injection
+  kubectl label namespace platform-apps istio-injection=enabled --overwrite
+  kubectl label namespace tyk-gateway istio-injection=enabled --overwrite
+
+9.3 Restart deployments (frontend/backend/tyk) so sidecars attach:
+  kubectl rollout restart deploy -n platform-apps
+  kubectl rollout restart deploy -n tyk-gateway
+
+9.4 Create Istio Gateway & VirtualServices for frontend, backend, tyk dashboard:
+  - Gateway listens on *.lab.local, TLS using wildcard secret.
+  - VirtualService routes:
+      react.lab.local  -> frontend service (port 80)
+      api.lab.local    -> backend service (port 3001)
+      tyk.lab.local    -> tyk dashboard service
+      argo.lab.local   -> Argo CD
+
+Sample Gateway snippet:
+  apiVersion: networking.istio.io/v1beta1
+  kind: Gateway
+  metadata:
+    name: lab-gateway
+    namespace: istio-system
+  spec:
+    selector:
+      istio: ingressgateway
+    servers:
+      - port:
+          number: 443
+          name: https
+          protocol: HTTPS
+        hosts:
+          - '*.lab.local'
+        tls:
+          mode: SIMPLE
+          credentialName: wildcard-lab-local
+
+-------------------------------------------------------------------------------
+10. Chaos Mesh (chaos-testing namespace)
+-------------------------------------------------------------------------------
+10.1 Install via Helm
+  helm repo add chaos-mesh https://charts.chaos-mesh.org
+  helm repo update
+  kubectl create namespace chaos-testing
+  helm install chaos-mesh chaos-mesh/chaos-mesh -n chaos-testing \
+    --set dashboard.securityMode=false \
+    --set chaosDaemon.runtime=containerd \
+    --set chaosDaemon.socketPath=/run/containerd/containerd.sock
+
+10.2 Access dashboard (optional) via Istio VirtualService (chaos.lab.local). Use RBAC to limit permissions.
+
+10.3 Example experiment (pod-kill for backend):
+  kubectl apply -n chaos-testing -f <<'EOF'
+  apiVersion: chaos-mesh.org/v1alpha1
+  kind: PodChaos
+  metadata:
+    name: kill-backend
+  spec:
+    action: pod-kill
+    mode: one
+    selector:
+      namespaces:
+        - platform-apps
+      labelSelectors:
+        app: backend
+    duration: '30s'
+    scheduler:
+      cron: '@every 5m'
+  EOF
+
+-------------------------------------------------------------------------------
+11. Argo CD (cicd namespace)
+-------------------------------------------------------------------------------
+11.1 Install
+  kubectl create namespace cicd
+  kubectl apply -n cicd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+11.2 Expose via Istio VirtualService (argo.lab.local). Bind TLS certificate.
+
+11.3 Initial admin password:
+  kubectl -n cicd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d
+
+11.4 Configure GitHub repo
+  argocd login argo.lab.local
+  argocd repo add https://github.com/<user>/sample-react-project.git --username <gh-user> --password <gh-token>
+
+11.5 Create Argo Application manifests (in repo)
+  apiVersion: argoproj.io/v1alpha1
+  kind: Application
+  metadata:
+    name: platform-app
+    namespace: cicd
+  spec:
+    destination:
+      namespace: platform-apps
+      server: https://kubernetes.default.svc
+    source:
+      repoURL: https://github.com/<user>/sample-react-project.git
+      targetRevision: main
+      path: k8s
+    syncPolicy:
+      automated:
+        prune: true
+        selfHeal: true
+
+11.6 Optional: Add Argo Workflows for CI pipelines, but focus on GitOps first.
+
+-------------------------------------------------------------------------------
+12. Observability – Elasticsearch + OpenTelemetry
+-------------------------------------------------------------------------------
+12.1 Install Elastic via Helm
+  helm repo add elastic https://helm.elastic.co
+  helm install elasticsearch elastic/elasticsearch \
+    --namespace observability --create-namespace \
+    --set replicas=1 --set volumeClaimTemplate.storageClassName=hostpath \
+    --set resources.requests.cpu=500m --set resources.requests.memory=2Gi
+
+12.2 Install Kibana (optional) or use OpenSearch Dashboards.
+  helm install kibana elastic/kibana -n observability \
+    --set service.type=ClusterIP
+
+12.3 Deploy OpenTelemetry Collector to gather traces/logs from Node/React/Tyk
+  kubectl apply -n observability -f <<'EOF'
+  apiVersion: opentelemetry.io/v1alpha1
+  kind: OpenTelemetryCollector
+  metadata:
+    name: otel
+  spec:
+    mode: deployment
+    config: |
+      receivers:
+        otlp:
+          protocols:
+            http:
+            grpc:
+      exporters:
+        logging: {}
+        elasticsearch:
+          endpoints: ["http://elasticsearch-master.observability.svc.cluster.local:9200"]
+      service:
+        pipelines:
+          traces:
+            receivers: [otlp]
+            exporters: [logging, elasticsearch]
+  EOF
+
+12.4 Instrument Node backend (add OTLP exporter)
+  npm install @opentelemetry/api @opentelemetry/sdk-node @opentelemetry/exporter-trace-otlp-http
+  Initialize tracer in server.js (before routes) to send traces to collector service.
+
+-------------------------------------------------------------------------------
+13. Internal DNS + HTTPS workflow
+-------------------------------------------------------------------------------
+1. On alma-db, configure BIND zone lab.local with A records:
+   - tyk.lab.local      -> 192.168.56.51 (MetalLB LB for Istio ingress)
+   - react.lab.local    -> 192.168.56.51
+   - api.lab.local      -> 192.168.56.51
+   - argo.lab.local     -> 192.168.56.51
+   - chaos.lab.local    -> 192.168.56.51
+2. Configure each workstation to trust the lab-root-ca.crt (export from cert-manager secret).
+3. Create browser entries or OS hosts only if DNS unavailable.
+
+-------------------------------------------------------------------------------
+14. Deployment Order Summary
+-------------------------------------------------------------------------------
+1. Prepare VMs (section 1)
+2. kubeadm init on alma-one, install Cilium (section 2)
+3. Join remaining nodes (section 3)
+4. Install MetalLB + cert-manager + DNS settings (section 4)
+5. Label namespaces (section 5)
+6. Setup MySQL on alma-db (section 6)
+7. Deploy React/Node (section 7)
+8. Install Tyk (section 8)
+9. Install Istio, configure gateway/virtual services (section 9)
+10. Install Chaos Mesh (section 10)
+11. Install Argo CD + configure GitOps (section 11)
+12. Install Elasticsearch + OTEL (section 12)
+13. Validate DNS/TLS (section 13)
+
+-------------------------------------------------------------------------------
+15. Validation Checklist
+-------------------------------------------------------------------------------
+- [ ] `kubectl get nodes` shows 5 Ready nodes.
+- [ ] `cilium status` healthy, Hubble optional.
+- [ ] `kubectl get svc -A` shows MetalLB external IP for istio-ingressgateway.
+- [ ] Browsing https://tyk.lab.local loads Tyk dashboard via TLS.
+- [ ] https://react.lab.local shows React app calling backend successfully (check user list).
+- [ ] OpenTelemetry traces arrive in Elasticsearch (verify index).
+- [ ] Argo CD UI accessible at https://argo.lab.local, application synced.
+- [ ] Chaos Mesh dashboard reachable; running experiment kills backend pod and auto-recovers.
+- [ ] MySQL on alma-db accessible from backend pod (test with `kubectl exec ... mysql -h mysql.lab.local`).
+
+-------------------------------------------------------------------------------
+16. Maintenance Tips
+-------------------------------------------------------------------------------
+- Backup etcd regularly (kubeadm etcdctl snapshot on control-plane).
+- Snapshot lab-root-ca and wildcard secret for reuse.
+- Use Argo CD app-of-apps pattern to codify everything.
+- Automate DNS entries using ExternalDNS (optional).
+- Consider enabling Prometheus/Grafana stack (kube-prometheus) for deeper metrics.
+
+End of document.
+
