@@ -39,9 +39,15 @@ spec:
         - name: DB_HOST
           value: "mysql"
         - name: DB_USER
-          value: "appuser"
+          valueFrom:
+            secretKeyRef:
+              name: mysql-credentials
+              key: db-user
         - name: DB_PASSWORD
-          value: "apppassword"
+          valueFrom:
+            secretKeyRef:
+              name: mysql-credentials
+              key: db-password
         - name: DB_NAME
           value: "sample_db"
         - name: DB_PORT
