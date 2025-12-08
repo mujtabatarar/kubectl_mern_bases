@@ -1,0 +1,27 @@
+docker ki build ki naming convention
+mycompany/project/service:version
+
+example 1
+registry.gitlab.com/mycompany/project/project-scope(if api):1.0.2
+
+1.0.2 -> first digit = major.
+1.0.2 -> 2nd digit = minor.
+1.0.2 -> 3rd digit = patch.
+
+Question : ✔ What does 1.2.1 mean?
+
+1.2.1 = MAJOR.MINOR.PATCH
+
+1 → MAJOR version.
+     Breaking changes, Big updates, Incompatible API changes
+
+2 → MINOR version
+        New features added, Backward-compatible changes
+
+1 → PATCH version
+        Bug fixes only, Safe update, No new features
+
+
+
+
+
