@@ -55,7 +55,7 @@ function App() {
       <div className="container">
         <header>
           <h1>Simple React + Node.js + MySQL App</h1>
-          <p>Users from MySQL Database</p>
+          <p>Users from MySQL Database phone 2</p>
         </header>
 
         <div className="content">
