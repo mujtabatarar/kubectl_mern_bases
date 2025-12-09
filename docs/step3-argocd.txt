@@ -1,0 +1,161 @@
+===============================================================================
+STEP 3 – ADD ARGO CD (GITOPS) FOR THE REACT + NODE APP
+===============================================================================
+Goal of this step:
+- Install Argo CD into its own namespace.
+- Log in to the Argo CD UI (via port-forward, no DNS yet).
+- Create one Argo CD Application that deploys your existing k8s manifests
+  from this repo to the `sample-app` namespace.
+
+Assumptions:
+- Steps 1 and 2 are working (app runs, secrets in use).
+- You run commands from an Alma node (e.g., alma-one) with kubectl access.
+- Project path on the node: /home/youruser/sample-react-project
+- Internet access from the cluster nodes (to pull Argo CD manifests and your
+  container images; adjust if you use an airgap registry).
+
+-------------------------------------------------------------------------------
+0. Namespaces we will use
+-------------------------------------------------------------------------------
+- Argo CD control plane: namespace `cicd`
+- Your app stays in: namespace `sample-app`
+
+-------------------------------------------------------------------------------
+1. Install Argo CD
+-------------------------------------------------------------------------------
+1.1 Create namespace
+  kubectl create namespace cicd
+
+1.2 Install Argo CD core components (official manifest)
+  kubectl apply -n cicd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+Wait for pods:
+  kubectl get pods -n cicd
+You should see pods like argocd-server, argocd-repo-server, argocd-application-controller, etc., reach STATUS Running.
+
+-------------------------------------------------------------------------------
+2. Access the Argo CD UI (no DNS yet)
+-------------------------------------------------------------------------------
+Port-forward the Argo CD server service to your Alma node:
+
+  kubectl port-forward -n cicd svc/argocd-server 8080:443
+
+Then, from the same node (or via SSH tunnel from Windows), open:
+  https://localhost:8080
+
+You will see a TLS warning (self-signed); proceed/accept for now.
+
+-------------------------------------------------------------------------------
+3. Login credentials
+-------------------------------------------------------------------------------
+Initial admin user: admin
+Initial password:
+  kubectl -n cicd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d && echo
+
+Use these to log in at https://localhost:8080.
+(You can change the password later in the UI or with: argocd account update-password)
+
+-------------------------------------------------------------------------------
+4. Prepare Argo CD to sync this repo
+-------------------------------------------------------------------------------
+Argo needs to read your Git repo. If using GitHub over HTTPS:
+Option A: Public repo (no auth needed) — simplest.
+Option B: Private repo — create a read-only GitHub PAT and add as a repo secret.
+
+Set your repo URL here (replace with yours):
+  https://github.com/<your-username>/sample-react-project.git
+
+If private, add credentials:
+  argocd repo add https://github.com/<your-username>/sample-react-project.git \
+    --username <gh-username> \
+    --password <gh-token>
+
+(Run this after you install the Argo CD CLI on your Alma node, or do it via the UI: Settings -> Repositories.)
+
+-------------------------------------------------------------------------------
+5. Create an Argo CD Application for your app
+-------------------------------------------------------------------------------
+We will point Argo to the `k8s/` folder of this repo and deploy into `sample-app`.
+
+Save this manifest locally as `k8s/argo-app-sample.yaml`:
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: sample-react-node
+  namespace: cicd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/<your-username>/sample-react-project.git
+    targetRevision: main
+    path: k8s
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: sample-app
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+    - CreateNamespace=true
+---
+
+(Adjust `repoURL` and `targetRevision` if needed.)
+
+Apply it:
+  kubectl apply -f k8s/argo-app-sample.yaml
+
+After a few seconds, check:
+  kubectl get applications -n cicd
+
+You should see `sample-react-node` with status Synced/Healthy once Argo finishes.
+
+-------------------------------------------------------------------------------
+6. Verify the deployment via Argo CD
+-------------------------------------------------------------------------------
+- In the Argo UI, you should see the Application and its resources (mysql StatefulSet, services, backend, frontend).
+- The resources should be Healthy and Synced.
+
+If something is OutOfSync or Degraded:
+- Click the resource in the UI to see events/logs, or run:
+  kubectl describe <resource> -n sample-app
+  kubectl logs <pod> -n sample-app
+
+-------------------------------------------------------------------------------
+7. Keep using port-forward for the app (same as Step 1/2)
+-------------------------------------------------------------------------------
+  kubectl port-forward -n sample-app svc/frontend 4000:80
+Open: http://localhost:4000
+
+-------------------------------------------------------------------------------
+8. (Optional) Install Argo CD CLI on the Alma node
+-------------------------------------------------------------------------------
+Download (example version v2.10.7):
+  VERSION=v2.10.7
+  curl -sSL -o argocd "https://github.com/argoproj/argo-cd/releases/download/${VERSION}/argocd-linux-amd64"
+  chmod +x argocd
+  sudo mv argocd /usr/local/bin/
+
+Login via CLI:
+  argocd login localhost:8080 --username admin --password <password> --insecure
+
+List apps:
+  argocd app list
+
+Sync manually (if needed):
+  argocd app sync sample-react-node
+
+-------------------------------------------------------------------------------
+9. Checklist before moving to Step 4 (DNS/HTTPS)
+-------------------------------------------------------------------------------
+You are ready for Step 4 when:
+- [ ] Argo CD is installed and running in namespace `cicd`.
+- [ ] You can log into the Argo UI via port-forward.
+- [ ] The Application `sample-react-node` is Synced and Healthy.
+- [ ] The app still works via port-forward at http://localhost:4000.
+
+End of Step 3 document.
+
+

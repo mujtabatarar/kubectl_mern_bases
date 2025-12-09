@@ -1,0 +1,292 @@
+===============================================================================
+STEP 4 – DNS + HTTPS FOR ARGO CD AND THE APP (NO SERVICE MESH YET)
+===============================================================================
+Goal of this step:
+- Add internal DNS names and HTTPS for:
+  - react.lab.local (frontend)
+  - api.lab.local (backend)
+  - argo.lab.local (Argo CD UI)
+- Use self-signed internal CA via cert-manager.
+- Use one Ingress controller (NGINX) and MetalLB for LoadBalancer IP.
+
+Assumptions:
+- Steps 1–3 are working (app via port-forward; Argo CD via port-forward).
+- Cluster has internet access to pull images/manifests.
+- You run commands from an Alma node (e.g., alma-one) with kubectl access.
+- MetalLB is allowed; if not installed, we will install it here.
+- You can add DNS entries (e.g., on alma-db BIND or /etc/hosts for testing).
+
+What we will install now (kubectl only, no Helm needed):
+- MetalLB (if not already)
+- cert-manager
+- NGINX Ingress Controller
+- Wildcard TLS cert *.lab.local from an internal CA
+- Ingress rules for frontend/backend and Argo CD
+
+Manifests you may already have created from this doc:
+- k8s/ingress-app.yaml
+- k8s/ingress-argocd.yaml
+- k8s/cert-manager/cluster-issuer-for-self-signed-root.yaml
+- k8s/cert-manager/root-ca-certificates.yaml
+- k8s/cert-manager/cluster-issuer-that-uses-the-root.yaml
+- k8s/cert-manager/wildcard-cert.yaml
+
+Target IP plan (adjust if you already reserved addresses):
+- MetalLB pool: 192.168.56.50-192.168.56.60
+- Reserve 192.168.56.51 for ingress (will be auto-assigned)
+
+DNS records you need to create in your internal DNS (alma-db BIND) or /etc/hosts:
+- react.lab.local -> 192.168.56.51
+- api.lab.local   -> 192.168.56.51
+- argo.lab.local  -> 192.168.56.51
+- *.lab.local     -> 192.168.56.51 (optional wildcard)
+
+-------------------------------------------------------------------------------
+1) Install MetalLB (skip if already installed and working)
+-------------------------------------------------------------------------------
+kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.5/config/manifests/metallb-native.yaml
+
+# Create an IP pool
+cat <<'EOF' | kubectl apply -f -
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: homelab-pool
+  namespace: metallb-system
+spec:
+  addresses:
+    - 192.168.56.50-192.168.56.60
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: homelab-l2
+  namespace: metallb-system
+EOF
+
+Check:
+  kubectl get pods -n metallb-system
+Should be Running.
+
+-------------------------------------------------------------------------------
+2) Install cert-manager (no Helm)
+-------------------------------------------------------------------------------
+# Create namespace
+kubectl create namespace cert-manager 2>/dev/null || true
+
+# Install cert-manager CRDs + controllers (example v1.13.3)
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.13.3/cert-manager.yaml
+
+Wait:
+  kubectl get pods -n cert-manager
+
+-------------------------------------------------------------------------------
+3) Create internal CA and wildcard certificate
+-------------------------------------------------------------------------------
+# ClusterIssuer for self-signed root
+cat <<'EOF' | kubectl apply -f -
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: lab-selfsigned
+spec:
+  selfSigned: {}
+EOF
+
+# Root CA certificate (10 years)
+cat <<'EOF' | kubectl apply -f -
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: lab-root-ca
+  namespace: cert-manager
+spec:
+  isCA: true
+  duration: 87600h
+  secretName: lab-root-ca
+  issuerRef:
+    name: lab-selfsigned
+    kind: ClusterIssuer
+EOF
+
+# ClusterIssuer that uses the root CA
+cat <<'EOF' | kubectl apply -f -
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: lab-ca
+spec:
+  ca:
+    secretName: lab-root-ca
+EOF
+
+# Wildcard cert for *.lab.local
+cat <<'EOF' | kubectl apply -f -
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: wildcard-lab-local
+  namespace: cert-manager
+spec:
+  secretName: wildcard-lab-local
+  duration: 8760h
+  dnsNames:
+    - '*.lab.local'
+  issuerRef:
+    name: lab-ca
+    kind: ClusterIssuer
+EOF
+
+Export the root CA to trust on clients (later):
+  kubectl get secret lab-root-ca -n cert-manager -o jsonpath='{.data.ca\.crt}' | base64 -d > lab-root-ca.crt
+
+-------------------------------------------------------------------------------
+4) Install NGINX Ingress Controller (no Helm)
+-------------------------------------------------------------------------------
+# Create namespace
+kubectl create namespace ingress-nginx 2>/dev/null || true
+
+# Install ingress-nginx (cloud provider manifest works on bare metal too)
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.10.0/deploy/static/provider/cloud/deploy.yaml
+
+# Add MetalLB pool annotation so the LB service gets an IP from homelab-pool
+kubectl patch svc ingress-nginx-controller -n ingress-nginx \
+  -p '{"metadata":{"annotations":{"metallb.universe.tf/address-pool":"homelab-pool"}}}'
+
+Check service to see the assigned EXTERNAL-IP:
+  kubectl get svc -n ingress-nginx
+You should see EXTERNAL-IP 192.168.56.51 (from MetalLB).
+Use this IP for your DNS A records.
+
+-------------------------------------------------------------------------------
+5) Ingress for frontend + backend (sample-app namespace)
+-------------------------------------------------------------------------------
+Create `k8s/ingress-app.yaml`:
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: app-ingress
+  namespace: sample-app
+  annotations:
+    kubernetes.io/ingress.class: nginx
+spec:
+  tls:
+    - hosts:
+        - react.lab.local
+        - api.lab.local
+      secretName: wildcard-lab-local  # from cert-manager in cert-manager ns (cluster-wide secret ref works via TLS passthrough)
+  rules:
+    - host: react.lab.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80
+    - host: api.lab.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 3001
+---
+
+Apply:
+  kubectl apply -f k8s/ingress-app.yaml
+
+-------------------------------------------------------------------------------
+6) Ingress for Argo CD (cicd namespace)
+-------------------------------------------------------------------------------
+Create `k8s/ingress-argocd.yaml`:
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: argocd-ingress
+  namespace: cicd
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+spec:
+  tls:
+    - hosts:
+        - argo.lab.local
+      secretName: wildcard-lab-local
+  rules:
+    - host: argo.lab.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: argocd-server
+                port:
+                  number: 443
+---
+
+Apply:
+  kubectl apply -f k8s/ingress-argocd.yaml
+
+-------------------------------------------------------------------------------
+7) Update DNS (or /etc/hosts for quick test)
+-------------------------------------------------------------------------------
+Point these to the ingress EXTERNAL-IP (e.g., 192.168.56.51):
+- react.lab.local
+- api.lab.local
+- argo.lab.local
+- *.lab.local (optional)
+
+If using BIND on alma-db, add A records. For quick testing on one node:
+  echo "192.168.56.51 react.lab.local api.lab.local argo.lab.local" | sudo tee -a /etc/hosts
+
+-------------------------------------------------------------------------------
+8) Trust the internal CA on clients
+-------------------------------------------------------------------------------
+- Copy `lab-root-ca.crt` to your workstation(s).
+- Install it in the OS/browser trust store so TLS shows as secure.
+- Without trusting it, you will see HTTPS warnings (expected for self-signed root).
+
+-------------------------------------------------------------------------------
+9) Test
+-------------------------------------------------------------------------------
+Check ingress resources:
+  kubectl get ingress -A
+
+Open in browser (after DNS/hosts update and CA trust):
+- https://react.lab.local
+- https://api.lab.local (should show backend JSON or 404 if no root route; main test is via frontend)
+- https://argo.lab.local (Argo UI, login with admin + your password)
+
+If frontend fails to load data:
+- Check backend via:
+  curl -k https://api.lab.local/health
+Check logs:
+  kubectl logs -n sample-app deploy/backend
+
+If Argo UI not reachable:
+- kubectl describe ingress argocd-ingress -n cicd
+- kubectl logs -n ingress-nginx deploy/ingress-nginx-controller
+
+-------------------------------------------------------------------------------
+10) Checklist before next steps (service mesh, Tyk, etc.)
+-------------------------------------------------------------------------------
+- [ ] MetalLB assigns an IP (e.g., 192.168.56.51) to ingress-nginx LoadBalancer.
+- [ ] DNS (or hosts file) points react/api/argo.lab.local to that IP.
+- [ ] HTTPS works with the wildcard cert; CA trusted on your client.
+- [ ] Frontend reachable at https://react.lab.local and can call backend.
+- [ ] Argo CD reachable at https://argo.lab.local and logs in.
+
+End of Step 4 document.
+
+
