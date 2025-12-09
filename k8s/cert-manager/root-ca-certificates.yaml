@@ -1,0 +1,12 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: lab-root-ca
+  namespace: cert-manager
+spec:
+  isCA: true
+  duration: 87600h
+  secretName: lab-root-ca
+  issuerRef:
+    name: lab-selfsigned
+    kind: ClusterIssuer
