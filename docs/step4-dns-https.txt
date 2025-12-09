@@ -83,6 +83,9 @@ Wait:
 -------------------------------------------------------------------------------
 3) Create internal CA and wildcard certificate
 -------------------------------------------------------------------------------
+
+3a
+kubectl apply -f cert-manager/root-ca-certificates.yaml -n cert-manager
 # ClusterIssuer for self-signed root
 cat <<'EOF' | kubectl apply -f -
 apiVersion: cert-manager.io/v1
@@ -93,6 +96,10 @@ spec:
   selfSigned: {}
 EOF
 
+
+
+3b
+kubectl apply -f cert-manager/cluster-issuer-for-self-signed-root.yaml
 # Root CA certificate (10 years)
 cat <<'EOF' | kubectl apply -f -
 apiVersion: cert-manager.io/v1
@@ -109,6 +116,9 @@ spec:
     kind: ClusterIssuer
 EOF
 
+
+3c
+kubectl apply -f cert-manager/cluster-issuer-that-uses-root-ca.yaml
 # ClusterIssuer that uses the root CA
 cat <<'EOF' | kubectl apply -f -
 apiVersion: cert-manager.io/v1
@@ -120,6 +130,8 @@ spec:
     secretName: lab-root-ca
 EOF
 
+
+3d
 # Wildcard cert for *.lab.local
 cat <<'EOF' | kubectl apply -f -
 apiVersion: cert-manager.io/v1
@@ -137,6 +149,9 @@ spec:
     kind: ClusterIssuer
 EOF
 
+
+
+3e
 Export the root CA to trust on clients (later):
   kubectl get secret lab-root-ca -n cert-manager -o jsonpath='{.data.ca\.crt}' | base64 -d > lab-root-ca.crt
 
