@@ -7,6 +7,9 @@ spec:
   isCA: true
   duration: 87600h
   secretName: lab-root-ca
+  commonName: lab-root-ca.lab.local
+  dnsNames:
+    - lab-root-ca.lab.local
   issuerRef:
     name: lab-selfsigned
     kind: ClusterIssuer
